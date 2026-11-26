@@ -9,7 +9,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const exe=process.argv[2];
 if(!exe)throw Error('Pass server executable');
 const root=mkdtempSync(join(tmpdir(),'private-sync-client-'));
-const env={...process.env,SYNC_DATA:join(root,'server'),SYNC_BIND:'127.0.0.1:18878'};
+const encrypted=process.env.SYNC_TEST_ENCRYPTED==='1';
+const env={...process.env,SYNC_DATA:join(root,'server'),SYNC_BIND:'127.0.0.1:18878',SYNC_ENCRYPTED_ONLY:encrypted?'1':'0'};
 const code=spawnSync(exe,['pair'],{env,encoding:'utf8'});
 assert.equal(code.status,0,code.stderr);
 const server=spawn(exe,[],{env,stdio:'ignore'});
@@ -64,12 +65,40 @@ async function sync(c){await c.sync();assert.equal(c.progress,'Синхрони�
 try{
  await ready();
  const a=await vault('device-a'),b=await vault('device-b');
+ if(encrypted){
+   const key=randomBytes(32).toString('hex');a.client.cfg.encryptionKey=key;b.client.cfg.encryptionKey=key;
+   assert.equal((await fetch(base+'/v1/index')).status,426);
+ }
  const redeem=await a.client.req('POST','/redeem',{code:code.stdout.trim(),name:'a'},false,false);a.client.cfg.token=redeem.token;
  const next=await a.client.pair();b.client.cfg.token=(await b.client.req('POST','/redeem',{code:next.code,name:'b'},false,false)).token;
+ if(encrypted){
+   const c=a.client.cipher();
+   const original=randomBytes(1024*1024+100);const wire=c.encode('test.bin',original);
+   assert.deepEqual(Buffer.from(c.decode('test.bin',wire)),original);
+   assert.deepEqual(c.encode('test.bin',original),wire);
+   assert.deepEqual(Buffer.from(c.decode('empty',c.encode('empty',Buffer.alloc(0)))),Buffer.alloc(0));
+   assert.throws(()=>c.decode('other.bin',wire));
+   const tampered=wire.slice();tampered[100]^=1;assert.throws(()=>c.decode('test.bin',tampered));
+   const changed=original.slice();changed[changed.length-1]^=1;
+   const mixed=wire.slice();mixed.set(c.encode('test.bin',changed).subarray(1048576),1048576);assert.throws(()=>c.decode('test.bin',mixed));
+   assert.equal(c.unpath(c.path('notes/тест.md')),'notes/тест.md');
+   await assert.rejects(()=>a.client.req('POST','/commit',{path:'plaintext.md',base_rev:0,hash:digest(Buffer.alloc(0)),size:0,chunks:[]}),/HTTP 400/);
+   console.log('PASS: encrypted block roundtrip, empty files, deterministic retries, tamper/path/mixed-revision rejection');
+ }
  const payload=randomBytes(3*1024*1024+137);
  await a.write('notes/big.bin',payload);await a.write('notes/тест.md',Buffer.from('Привет'));
  await sync(a.client);
- const remote=(await a.client.req('GET','/index')).find(x=>x.path==='notes/big.bin');
+ const remote=(await a.client.remoteIndex()).find(x=>x.path==='notes/big.bin');
+ if(encrypted){
+   const raw=await a.client.req('GET','/index');assert.ok(raw.every(x=>x.path.startsWith('e2ee-v1/')));
+   assert.ok(!JSON.stringify(raw).includes('notes/big.bin'));
+   const note=(await a.client.remoteIndex()).find(x=>x.path==='notes/тест.md');
+   const stored=Buffer.from(await a.client.req('GET','/chunks/'+note.chunks[0]));
+   assert.ok(!stored.includes(Buffer.from('Привет')));
+   const key=b.client.cfg.encryptionKey;b.client.cfg.encryptionKey=randomBytes(32).toString('hex');
+   await assert.rejects(()=>b.client.remoteIndex(),/Wrong recovery key/);b.client.cfg.encryptionKey=key;
+   console.log('PASS: remote filenames and content encrypted; wrong recovery key rejected');
+ }
  failChunk=remote.chunks[1];await b.client.sync();
  assert.ok(failed>=4);assert.ok(!b.exists('notes/big.bin'));
  assert.match(b.client.progress,/Ошибки: 1/);
@@ -83,7 +112,7 @@ try{
  a.client.cfg.deleteEnabled=true;b.client.cfg.deleteEnabled=true;
  const deletedHash=a.client.cfg.base['notes/тест.md'];a.client.cfg.pendingDeletes['notes/тест.md']=deletedHash;await a.remove('notes/тест.md');await sync(a.client);await sync(b.client);
  assert.ok(!b.exists('notes/тест.md'));assert.equal((await fs.readFile(join(b.dir,'.trash','notes_тест.md'))).toString(),'изменено');
- const versions=await a.client.req('POST','/history',{path:'notes/тест.md'});assert.ok(versions.length>=2);
+ const versions=await a.client.history('notes/тест.md');assert.ok(versions.length>=2);
  await a.client.restoreVersion(versions[0]);await sync(b.client);
  assert.equal((await b.read('notes/тест.md')).toString(),'изменено');
  console.log('PASS: actual plugin algorithm, edit, deletion to trash, restore');

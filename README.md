@@ -5,7 +5,7 @@
 
 A self-hosted synchronization prototype for Obsidian, with a Rust server and a TypeScript plugin. The goal is simple device pairing and resilient transfers over unstable connections, without a separate desktop synchronization app.
 
-> **Experimental (0.2.0 plugin).** This is not a production-ready replacement for Obsidian Sync. Use a test vault and keep independent backups. No end-to-end encryption yet. Not affiliated with Obsidian.
+> **Experimental (0.3.0).** This is not a production-ready replacement for Obsidian Sync. Use a test vault and keep independent backups. Encrypted mode is implemented but has not been independently audited. Not affiliated with Obsidian.
 
 ## Features
 
@@ -55,7 +55,7 @@ Requirements: Rust stable, Node.js 24, npm, Obsidian for manual UI testing.
    ```
 
 4. Copy `plugin/main.js` and `plugin/manifest.json` into `.obsidian/plugins/private-vault-sync/` within a separate test vault. Enable Private Vault Sync in Obsidian's community plugins.
-5. In the plugin settings, enter the loopback server address and the enrollment code. Additional devices can use a pairing link or QR code after installing the plugin and opening the intended vault.
+5. In the plugin settings, enter the loopback server address, enrollment code and recovery key. Generate a random recovery key on the first device only and store it in a password manager. Additional devices can use a pairing link or QR code and enter the same key separately.
 
 Never run two sync engines on the same vault at the same time.
 
@@ -81,7 +81,7 @@ A local stress test transferred 800 MiB of synthetic attachments in both directi
 
 ## Roadmap
 
-- End-to-end encryption, with secure key management and recovery.
+- Independent cryptographic review, improved key management and recovery UX.
 - Full settings sync, directory renames and text conflict merging.
 - Storage quota validation, garbage collection, tested backup/restore and security review.
 - Memory-efficient streaming of large files, especially on mobile.
@@ -89,7 +89,7 @@ A local stress test transferred 800 MiB of synthetic attachments in both directi
 
 ## Current limitations
 
-Single-vault prototype. Files up to 512 MiB; the plugin can allocate whole files in memory. No end-to-end encryption: the server can read contents, filenames and metadata. The GUI smoke test fixture exists but real GUI integration and mobile testing have not been completed. Do not make the server publicly accessible or use it as the sole copy of important data.
+Single-vault prototype. Files up to 512 MiB; the plugin can allocate whole files in memory. New connections require a random recovery key; the legacy test mode does not encrypt data. Encrypted deployments reveal file sizes, equality within a context, revision metadata, devices and access patterns. They do not defend against server rollback or deletion. The GUI smoke test fixture exists but real GUI integration and mobile testing have not been completed. Do not make the server publicly accessible or use it as the sole copy of important data.
 
 See [SECURITY.md](SECURITY.md). Licensed under [MIT](LICENSE).
 
@@ -97,3 +97,11 @@ See [SECURITY.md](SECURITY.md). Licensed under [MIT](LICENSE).
 ## Isolated deployment pilot
 
 The Dockerfile and deploy/compose.test.yaml are intended for synthetic data only. The container has no published ports, runs without root, and uses a separate persistent data directory. The prototype enforces a block storage quota, a concurrent request limit, a body size limit and request timeout. These are not a substitute for a full security audit or a complete disk quota. Restrict pilot access at the reverse proxy, use HTTPS, and never connect the sole copy of a real vault. Set SYNC_PROXY_NETWORK to an existing dedicated proxy network; initialize deploy/data with owner UID/GID 10001. See the existing local tests for validation.
+
+## Experimental encrypted protocol (v1)
+
+The client uses AES-256-GCM-SIV (RFC 8452) via @noble/ciphers, HKDF-SHA-256 with separate keys for path encryption, content encryption and nonce derivation, and a random 256-bit recovery key. Deterministic keyed nonces allow retransmission of identical encrypted blocks without re-uploading them. Encrypted blocks are bound to the file path, index and count; an encrypted whole-file digest rejects mixed-version blocks. The server receives encrypted names and encrypted content, not the recovery key. It still observes ciphertext sizes, equality within a context, revisions and access patterns. The protocol does not authenticate server history or prevent rollback, deletion or denial of service. Local notes and the plugin's local configuration (including the recovery key) are not encrypted at rest by this plugin.
+
+The encrypted-only pilot requires a fresh compatible data directory, uses SYNC_ENCRYPTED_ONLY=1, rejects legacy clients, and prevents updates/deletion of the key-check marker. This compatibility gate does not prove that arbitrary clients encrypt their payloads. Never migrate an unencrypted database in place or reuse a recovery key for unrelated vaults. Loss of the recovery key means loss of access to encrypted data. There is no server-side reset or recovery. Retain independent backups and do not treat this prototype as audited software.
+
+Run the encrypted integration suite with SYNC_TEST_ENCRYPTED=1 and SYNC_TEST_FILES=12 (environment variables) using tests/client.mjs and the compiled server. CI runs both encrypted and legacy suites.

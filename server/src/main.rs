@@ -77,6 +77,7 @@ struct App {
     storage: Arc<Mutex<u64>>,
     quota: u64,
     requests: Arc<tokio::sync::Semaphore>,
+    encrypted_only: bool,
 }
 impl App {
     fn open(dir: PathBuf) -> std::result::Result<Self, Box<dyn std::error::Error>> {
@@ -113,6 +114,24 @@ impl App {
             .map(|v| v.parse::<u64>())
             .transpose()?
             .unwrap_or(8 * 1024 * 1024 * 1024);
+        let encrypted_only = std::env::var("SYNC_ENCRYPTED_ONLY").as_deref() == Ok("1");
+        if encrypted_only {
+            let incompatible: i64 = db.query_row(
+                "SELECT count(*) FROM files WHERE path NOT LIKE 'e2ee-v1/%'",
+                [],
+                |r| r.get(0),
+            )?;
+            let old_versions: i64 = db.query_row(
+                "SELECT count(*) FROM versions WHERE path NOT LIKE 'e2ee-v1/%'",
+                [],
+                |r| r.get(0),
+            )?;
+            if incompatible != 0 || old_versions != 0 {
+                return Err(
+                    "encrypted-only mode requires a fresh or compatible encrypted store".into(),
+                );
+            }
+        }
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             blobs: dir.join("blobs"),
@@ -121,6 +140,7 @@ impl App {
             storage: Arc::new(Mutex::new(used)),
             quota,
             requests: Arc::new(tokio::sync::Semaphore::new(24)),
+            encrypted_only,
         })
     }
     fn pair(&self) -> Result<String> {
@@ -134,6 +154,21 @@ impl App {
         )
         .map_err(internal)?;
         Ok(code)
+    }
+    fn accepts_path(&self, p: &str) -> bool {
+        valid_path(p)
+            && (!self.encrypted_only
+                || p == "e2ee-v1/keycheck"
+                || p.strip_prefix("e2ee-v1/").is_some_and(|v| {
+                    !v.is_empty()
+                        && v.split('/').all(|part| {
+                            !part.is_empty()
+                                && part.len() <= 120
+                                && part
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        })
+                }))
     }
     fn auth(&self, headers: &HeaderMap) -> Result<i64> {
         let token = headers
@@ -317,7 +352,10 @@ struct Commit {
 }
 async fn commit(State(s): State<App>, h: HeaderMap, Json(c): Json<Commit>) -> Result<Json<File>> {
     s.auth(&h)?;
-    if !valid_path(&c.path)
+    if !s.accepts_path(&c.path)
+        || (s.encrypted_only
+            && c.path == "e2ee-v1/keycheck"
+            && (c.base_rev != 0 || c.size > 1024 || c.chunks.len() != 1))
         || c.base_rev < 0
         || !valid_hash(&c.hash)
         || c.size > MAX_FILE
@@ -361,7 +399,7 @@ async fn delete_file(
     Json(c): Json<DeleteFile>,
 ) -> Result<Json<File>> {
     s.auth(&h)?;
-    if !valid_path(&c.path) || c.base_rev < 1 {
+    if !s.accepts_path(&c.path) || c.path == "e2ee-v1/keycheck" || c.base_rev < 1 {
         return Err(bad("invalid deletion"));
     }
     let mut db = s.db.lock().map_err(internal)?;
@@ -416,7 +454,7 @@ async fn history(
     Json(c): Json<HistoryQuery>,
 ) -> Result<Json<Vec<File>>> {
     s.auth(&h)?;
-    if !valid_path(&c.path) {
+    if !s.accepts_path(&c.path) {
         return Err(bad("invalid path"));
     }
     let db = s.db.lock().map_err(internal)?;
@@ -569,6 +607,16 @@ async fn limit_requests(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if s.encrypted_only
+        && !matches!(req.uri().path(), "/v1/health" | "/v1/watch")
+        && req
+            .headers()
+            .get("x-private-sync-protocol")
+            .and_then(|h| h.to_str().ok())
+            != Some("e2ee-v1")
+    {
+        return (StatusCode::UPGRADE_REQUIRED, "encrypted client required").into_response();
+    }
     let Ok(_permit) = s.requests.clone().try_acquire_owned() else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response();
     };

@@ -2,12 +2,13 @@ import { App, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile,
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import * as QRCode from "qrcode";
+import { VaultCipher, newVaultKey, E2EE_PREFIX, KEY_CHECK } from "./crypto";
 
 const CHUNK = 1024 * 1024;
 const MAX = 512 * CHUNK;
 const digest = (data: Uint8Array) => bytesToHex(sha256(data));
 type RemoteFile = { path: string; rev: number; hash: string; size: number; chunks: string[]; deleted?: boolean };
-type Config = { server: string; token: string; base: Record<string, string>; device: string; deleteEnabled: boolean; pendingDeletes: Record<string,string>; tombstones: Record<string,number> };
+type Config = { server: string; token: string; base: Record<string, string>; device: string; deleteEnabled: boolean; pendingDeletes: Record<string,string>; tombstones: Record<string,number>; encryptionKey?: string };
 const defaults: Config = {server:"",token:"",base:{},device:"Obsidian",deleteEnabled:false,pendingDeletes:{},tombstones:{}};
 const valid = (path: string) => path.length>0 && path.length<=4096 && path.split("/").every(x=>x && x!=="." && x!==".." && !x.endsWith(".") && !x.endsWith(" ") && !/[\\:*?"<>|\x00-\x1f]/.test(x) && ![".obsidian",".trash",".git"].includes(x.toLowerCase()));
 const delay = (ms:number)=>new Promise<void>(resolve=>window.setTimeout(resolve,ms));
@@ -15,6 +16,7 @@ class HttpError extends Error { constructor(public status:number){super("HTTP "+
 export default class PrivateSync extends Plugin {
   cfg:Config={...defaults,base:Object.create(null),pendingDeletes:Object.create(null),tombstones:Object.create(null)};
   running=false;
+  connecting=false;
   pending=false;
   stopped=false;
   status!:HTMLElement;
@@ -28,6 +30,34 @@ export default class PrivateSync extends Plugin {
   reconnectTimer=0;
   reconnectAttempts=0;
   realtime=false;
+  private cipherCache?:{key:string,value:VaultCipher};
+  cipher():VaultCipher|undefined {
+    const key=this.cfg.encryptionKey;
+    if(!key)return undefined;
+    if(this.cipherCache?.key!==key)this.cipherCache={key,value:new VaultCipher(key)};
+    return this.cipherCache.value;
+  }
+  wirePath(path:string){if(!valid(path))throw Error("Invalid local path");return this.cipher()?.path(path)??path;}
+  async remoteIndex():Promise<RemoteFile[]> {
+    let rows:RemoteFile[]=await this.req("GET","/index");
+    const cipher=this.cipher();
+    if(!cipher){if(rows.some(r=>r.path.startsWith(E2EE_PREFIX)))throw Error("Encrypted vault requires its recovery key");return rows;}
+    const marker=cipher.marker(),hash=digest(marker);
+    if(!rows.length){
+      if(Object.keys(this.cfg.base).length)throw Error("Remote vault unexpectedly empty; sync stopped");
+      await this.req("PUT","/chunks/"+hash,marker.buffer,true);
+      await this.req("POST","/commit",{path:KEY_CHECK,base_rev:0,hash,size:marker.length,chunks:[hash]});
+      rows=await this.req("GET","/index");
+    }
+    const check=rows.find(r=>r.path===KEY_CHECK);
+    if(!check||check.deleted||check.hash!==hash||check.chunks.length!==1||check.chunks[0]!==hash||check.size!==marker.length)throw Error("Wrong recovery key or incompatible remote vault; sync stopped");
+    return rows.filter(r=>r.path!==KEY_CHECK).map(r=>{const path=cipher.unpath(r.path);if(!valid(path))throw Error("Invalid decrypted path");return {...r,path};});
+  }
+  async history(path:string):Promise<RemoteFile[]>{
+    await this.remoteIndex();
+    const rows:RemoteFile[]=await this.req("POST","/history",{path:this.wirePath(path)});
+    return rows.map(r=>({...r,path:this.cipher()?.unpath(r.path)??r.path}));
+  }
   startWatch(){
     if(this.stopped||!this.cfg.token||this.socket||typeof WebSocket==="undefined")return;
     let ws:WebSocket;
@@ -97,6 +127,7 @@ export default class PrivateSync extends Plugin {
   endpoint(){const u=new URL(this.cfg.server.trim()); if(u.username||u.password||u.search||u.hash)throw new Error("Некорректный адрес сервера"); if(u.protocol!=="https:"&&!(u.protocol==="http:"&&["localhost","127.0.0.1"].includes(u.hostname)))throw new Error("Требуется HTTPS");return u.toString().replace(/\/+$/,"");}
   async req(method:string,path:string,body?:unknown,binary=false,auth=true):Promise<any>{
     const headers:Record<string,string>={};
+    if(this.cfg.encryptionKey)headers["X-Private-Sync-Protocol"]="e2ee-v1";
     if(auth)headers.Authorization="Bearer "+this.cfg.token;
     let payload:string|ArrayBuffer|undefined;
     if(body!==undefined){if(binary){headers["Content-Type"]="application/octet-stream";payload=body as ArrayBuffer;}else{headers["Content-Type"]="application/json";payload=JSON.stringify(body);}}
@@ -112,11 +143,19 @@ export default class PrivateSync extends Plugin {
       }catch(e){if(i===3||path==="/redeem"||path==="/pair"||(e instanceof HttpError && e.status<500 && e.status!==429))throw e;await delay(500*2**i);}
     }
   }
-  async connect(server:string,code:string,device:string){
-    if(this.running)throw new Error("Синхронизация активна");
-    this.cfg.server=server;this.cfg.device=device;
-    const r=await this.req("POST","/redeem",{code:code.trim(),name:device},false,false);
-    this.cfg.token=r.token;this.cfg.base=Object.create(null);this.cfg.pendingDeletes=Object.create(null);this.cfg.tombstones=Object.create(null);await this.save();this.startWatch();void this.sync();
+  async connect(server:string,code:string,device:string,key:string){
+    if(this.running||this.connecting)throw new Error("Синхронизация активна");
+    if(this.cfg.token)throw Error("Already connected");
+    new VaultCipher(key.trim());
+    this.connecting=true;
+    try{
+      this.cfg.server=server;this.cfg.device=device;this.cfg.encryptionKey=key.trim().toLowerCase();
+      const r=await this.req("POST","/redeem",{code:code.trim(),name:device},false,false);
+      this.cfg.token=r.token;this.cfg.base=Object.create(null);this.cfg.pendingDeletes=Object.create(null);this.cfg.tombstones=Object.create(null);
+      await this.remoteIndex();await this.save();
+    }catch(e){this.cfg.token="";delete this.cfg.encryptionKey;this.cipherCache=undefined;throw e;}
+    finally{this.connecting=false;}
+    this.startWatch();void this.sync();
   }
   async pair(){return await this.req("POST","/pair",{});}
   async devices():Promise<{id:number,name:string,created:number,current:boolean}[]>{return this.req("GET","/devices");}
@@ -147,7 +186,7 @@ export default class PrivateSync extends Plugin {
       data.set(b,offset);offset+=b.length;
     }
     if(offset!==r.size||digest(data)!==r.hash)throw new Error("Ошибка целостности файла");
-    return data;
+    return this.cipher()?.decode(r.path,data)??data;
   }
   async clearCache(r:RemoteFile){try{await this.app.vault.adapter.rmdir(this.cachePath(r),true);}catch{}}
   async markDeleted(path:string,rev:number){
@@ -155,7 +194,7 @@ export default class PrivateSync extends Plugin {
   }
   async deleteRemote(path:string,r:RemoteFile){
     if(await this.local(path))throw new Error("Файл появился снова");
-    const result:RemoteFile=await this.req("POST","/delete",{path,base_rev:r.rev});
+    const result:RemoteFile=await this.req("POST","/delete",{path:this.wirePath(path),base_rev:r.rev});
     await this.markDeleted(path,result.rev);
   }
   async trashLocal(r:RemoteFile,expected:string){
@@ -171,13 +210,13 @@ export default class PrivateSync extends Plugin {
     if(this.running)throw new Error("Синхронизация активна");
     this.running=true;
     try{
-      const latest:RemoteFile[]=await this.req("GET","/index");
+      const latest=await this.remoteIndex();
       const current=latest.find(f=>f.path===r.path);
       if(!current)throw new Error("Файл не найден на сервере");
       const local=await this.local(r.path,true);
       if(local&&local.hash!==current.hash)throw new Error("Сначала сохраните локальные изменения");
       await this.fetchFile(r);
-      await this.req("POST","/commit",{path:r.path,base_rev:current.rev,hash:r.hash,size:r.size,chunks:r.chunks});
+      await this.req("POST","/commit",{path:this.wirePath(r.path),base_rev:current.rev,hash:r.hash,size:r.size,chunks:r.chunks});
       await this.pull(r,local?.hash??null);
       await this.clearCache(r);await this.save();
     }finally{this.running=false;}
@@ -188,7 +227,10 @@ export default class PrivateSync extends Plugin {
     if(f.stat.size>MAX)throw new Error("Файл больше 512 МиБ");
     const mtime=f.stat.mtime,size=f.stat.size,c=this.localHashes.get(path);
     if(!force&&c&&c.mtime===mtime&&c.size===size)return {hash:c.hash};
-    const data=new Uint8Array(await this.app.vault.readBinary(f)),hash=digest(data);
+    const plain=new Uint8Array(await this.app.vault.readBinary(f));
+    const data=this.cipher()?.encode(path,plain)??plain;
+    if(data.length>MAX)throw Error("Encrypted file exceeds server size limit");
+    const hash=digest(data);
     if(f.stat.mtime!==mtime||f.stat.size!==size)throw new Error("Файл изменён при чтении");
     this.localHashes.set(path,{mtime,size,hash});
     return {data,hash};
@@ -200,7 +242,7 @@ export default class PrivateSync extends Plugin {
     for(let i=0;i<data.length;i+=CHUNK){const b=data.slice(i,i+CHUNK);parts.push(b);chunks.push(digest(b));}
     const missing=new Set<string>(await this.req("POST","/missing",{hashes:chunks}));
     for(let i=0;i<chunks.length;i++){if(missing.has(chunks[i])){await this.req("PUT","/chunks/"+chunks[i],parts[i].buffer,true);missing.delete(chunks[i]);this.transferred+=parts[i].length;this.renderProgress();}}
-    await this.req("POST","/commit",{path,base_rev:remote?.rev??0,hash:local.hash,size:data.length,chunks});
+    await this.req("POST","/commit",{path:this.wirePath(path),base_rev:remote?.rev??0,hash:local.hash,size:data.length,chunks});
     this.cfg.base[path]=local.hash;delete this.cfg.tombstones[path];delete this.cfg.pendingDeletes[path];
   }
   async pull(r:RemoteFile,expected:string|null){
@@ -213,7 +255,7 @@ export default class PrivateSync extends Plugin {
     this.cfg.base[r.path]=r.hash;delete this.cfg.tombstones[r.path];delete this.cfg.pendingDeletes[r.path];await this.clearCache(r);
   }
   async sync(){
-    if(this.stopped||!this.cfg.token)return;if(this.running){this.pending=true;return;}
+    if(this.stopped||this.connecting||!this.cfg.token)return;if(this.running){this.pending=true;return;}
     this.running=true;let done=0,conflicts=0,errors=0;
     this.errorsByPath=Object.create(null);this.conflictsByPath=[];
     const deleteCount=Object.keys(this.cfg.pendingDeletes).length;
@@ -222,7 +264,7 @@ export default class PrivateSync extends Plugin {
     try{
       this.render("Проверка…");
       if(Date.now()-this.fullCheckAt>30*60*1000){this.localHashes.clear();this.fullCheckAt=Date.now();}
-      const remote:RemoteFile[]=await this.req("GET","/index");
+      const remote=await this.remoteIndex();
       const map=new Map(remote.map(r=>[r.path,r]));
       const paths=[...new Set([...this.app.vault.getFiles().map(f=>f.path),...map.keys()])].filter(valid);
       this.syncStarted=Date.now();this.total=paths.length;this.completed=0;this.transferred=0;let i=0;
@@ -257,11 +299,15 @@ class SyncSettings extends PluginSettingTab {
   constructor(app:App,private p:PrivateSync){super(app,p);}
   display(){
     const el=this.containerEl;el.empty();el.createEl("h2",{text:"Private Vault Sync"});
-    let server=this.p.cfg.server,code="",device=this.p.cfg.device;
+    let server=this.p.cfg.server,code="",device=this.p.cfg.device,key="";
     new Setting(el).setName("Адрес сервера").addText(t=>t.setValue(server).onChange(v=>server=v));
     new Setting(el).setName("Одноразовый код").addText(t=>{t.inputEl.type="password";t.onChange(v=>code=v);});
     new Setting(el).setName("Имя устройства").addText(t=>t.setValue(device).onChange(v=>device=v));
-    new Setting(el).setName("Подключение").addButton(b=>b.setButtonText("Подключить").setCta().onClick(async()=>{try{if(this.p.cfg.token)throw new Error("Уже подключено");await this.p.connect(server,code,device);code="";new Notice("Подключено");this.display();}catch(e){new Notice(String(e));}}));
+    if(!this.p.cfg.token){
+      new Setting(el).setName("Ключ шифрования").setDesc("64 hex characters. Сохрани ключ отдельно: без него восстановить данные невозможно.").addText(t=>{t.inputEl.type="password";t.onChange(v=>key=v);});
+      new Setting(el).setName("Первое устройство").setDesc("Только для нового пустого сервера. На других устройствах используй тот же ключ.").addButton(b=>b.setButtonText("Создать ключ").onClick(()=>new RecoveryKeyModal(this.app,newVaultKey()).open()));
+    }else new Setting(el).setName("Шифрование").setDesc(this.p.cfg.encryptionKey?"AES-256-GCM-SIV":"Legacy test mode (not encrypted)");
+    new Setting(el).setName("Подключение").addButton(b=>b.setButtonText("Подключить").setCta().setDisabled(!!this.p.cfg.token).onClick(async()=>{try{await this.p.connect(server,code,device,key);code="";key="";new Notice("Подключено");this.display();}catch(e){new Notice(String(e));}}));
     new Setting(el).setName("Новое устройство").addButton(b=>b.setButtonText("Получить код").setDisabled(!this.p.cfg.token).onClick(async()=>{try{const r=await this.p.pair();new PairCodeModal(this.app,this.p,r.code).open();}catch(e){new Notice(String(e));}}));
     new Setting(el).setName("Состояние").setDesc(this.p.progress).addButton(b=>b.setButtonText("Синхронизировать").onClick(()=>void this.p.sync()));
     new Setting(el).setName("Синхронизация удалений").setDesc("По умолчанию выключена. Только подтверждённые локальные удаления; старые версии остаются на сервере.").addToggle(t=>t.setValue(this.p.cfg.deleteEnabled).onChange(async v=>{this.p.cfg.deleteEnabled=v;if(!v)this.p.cfg.pendingDeletes=Object.create(null);await this.p.save();}));
@@ -289,7 +335,7 @@ class HistoryModal extends Modal{
     let path=this.app.workspace.getActiveFile()?.path??"";
     const results=el.createDiv();
     new Setting(el).setName("Путь файла").addText(t=>t.setValue(path).onChange(v=>path=v)).addButton(b=>b.setButtonText("Найти").onClick(async()=>{
-      results.empty();try{const rows:RemoteFile[]=await this.p.req("POST","/history",{path});if(!rows.length)results.createEl("p",{text:"Нет предыдущих версий"});
+      results.empty();try{const rows=await this.p.history(path);if(!rows.length)results.createEl("p",{text:"Нет предыдущих версий"});
       for(const r of rows)new Setting(results).setName("Версия "+r.rev).setDesc(r.size+" байт").addButton(btn=>btn.setButtonText("Восстановить").onClick(async()=>{btn.setDisabled(true);try{await this.p.restoreVersion(r);new Notice("Версия восстановлена");this.close();}catch(e){new Notice(String(e));btn.setDisabled(false);}}));
       }catch(e){results.createEl("p",{text:String(e)});}
     }));
@@ -308,7 +354,7 @@ class PairCodeModal extends Modal{
   onOpen(){
     const el=this.contentEl;el.empty();el.createEl("h2",{text:"Подключить новое устройство"});
     const link="obsidian://private-vault-sync?"+new URLSearchParams({server:this.p.endpoint(),code:this.code}).toString();
-    el.createEl("p",{text:"Установи плагин на новом устройстве, открой нужное хранилище и импортируй ссылку. Код действует 10 минут и только один раз."});
+    el.createEl("p",{text:"Установи плагин на новом устройстве, открой нужное хранилище и импортируй ссылку. Код действует 10 минут и только один раз. Ключ шифрования вводится отдельно."});
     const canvas=el.createEl("canvas");canvas.style.display="block";canvas.style.margin="12px auto";canvas.style.maxWidth="100%";void QRCode.toCanvas(canvas,link,{width:260,margin:2,errorCorrectionLevel:"M"}).catch(()=>canvas.remove());
     const box=el.createEl("textarea",{text:link});box.readOnly=true;box.rows=4;box.style.width="100%";
     new Setting(el).addButton(b=>b.setButtonText("Скопировать ссылку").setCta().onClick(async()=>{try{await navigator.clipboard.writeText(link);new Notice("Ссылка скопирована");}catch{box.select();new Notice("Скопируйте выделенную ссылку");}}));
@@ -322,9 +368,15 @@ class PairConnectModal extends Modal{
     const el=this.contentEl;el.empty();el.createEl("h2",{text:"Подключить хранилище"});
     el.createEl("p",{text:"Сервер: "+this.server});
     el.createEl("p",{text:"Будут синхронизированы файлы текущего хранилища. Убедись, что выбран правильный сервер."});
-    let device=this.p.cfg.device;
+    let device=this.p.cfg.device,key="";
     new Setting(el).setName("Имя устройства").addText(t=>t.setValue(device).onChange(v=>device=v));
-    new Setting(el).addButton(b=>b.setButtonText("Подключить").setCta().onClick(async()=>{b.setDisabled(true);try{await this.p.connect(this.server,this.code,device);this.close();}catch(e){new Notice(String(e));b.setDisabled(false);}}));
+    new Setting(el).setName("Ключ шифрования").addText(t=>{t.inputEl.type="password";t.onChange(v=>key=v);});
+    new Setting(el).addButton(b=>b.setButtonText("Подключить").setCta().onClick(async()=>{b.setDisabled(true);try{await this.p.connect(this.server,this.code,device,key);key="";this.close();}catch(e){new Notice(String(e));b.setDisabled(false);}}));
   }
   onClose(){this.contentEl.empty();this.code="";}
+}
+class RecoveryKeyModal extends Modal{
+  constructor(app:App,private key:string){super(app);}
+  onOpen(){const el=this.contentEl;el.empty();el.createEl("h2",{text:"Ключ нового хранилища"});el.createEl("p",{text:"Сохрани этот ключ в менеджере паролей и введи его при подключении. Сервер не получает ключ. Не отправляй его в чаты."});const box=el.createEl("textarea",{text:this.key});box.readOnly=true;box.rows=3;box.style.width="100%";new Setting(el).addButton(b=>b.setButtonText("Выделить ключ").onClick(()=>box.select()));}
+  onClose(){this.key="";this.contentEl.empty();}
 }
