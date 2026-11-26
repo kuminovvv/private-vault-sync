@@ -44,6 +44,7 @@ jobs:
           exe=./server/target/debug/private-sync
           if [[ "$RUNNER_OS" == Windows ]]; then exe="$exe.exe"; fi
           node tests/integration.mjs "$exe"
+          node tests/account.mjs "$exe"
           node tests/client.mjs "$exe"
           SYNC_TEST_ENCRYPTED=1 SYNC_TEST_FILES=12 node tests/client.mjs "$exe"
       - name: Backup and restore test

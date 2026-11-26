@@ -5,7 +5,7 @@
 
 A self-hosted synchronization prototype for Obsidian, with a Rust server and a TypeScript plugin. The goal is simple device pairing and resilient transfers over unstable connections, without a separate desktop synchronization app.
 
-> **Experimental (0.3.1).** This is not a production-ready replacement for Obsidian Sync. Use a test vault and keep independent backups. Encrypted mode is implemented but has not been independently audited. Not affiliated with Obsidian.
+> **Experimental (0.4.0).** This is not a production-ready replacement for Obsidian Sync. Use a test vault and keep independent backups. Encrypted mode is implemented but has not been independently audited. Not affiliated with Obsidian.
 
 ## Features
 
@@ -24,7 +24,9 @@ A self-hosted synchronization prototype for Obsidian, with a Rust server and a T
 
 Download the ZIP from the [Releases page](https://github.com/kuminovvv/private-vault-sync/releases), extract it into your vault's `.obsidian/plugins/private-vault-sync/`, then enable Private Vault Sync under Community plugins. On Android, use a file manager that can display hidden folders. There is no separate sync application. Keep the original vault and a separate backup until you have verified a complete round trip on two devices.
 
-For the first device enter the HTTPS address, a server-issued one-time code, and click **Create key**. Save the generated recovery key in your password manager. The plugin fills the key field automatically. On subsequent devices use the pairing link or QR code and the same recovery key. The code and the key are separate; do not share either publicly.
+For a new, empty store, the administrator enables the temporary loopback-only setup listener using `deploy/compose.owner-setup.yaml` and an authenticated SSH local forward. Never publish the administrative port or proxy its routes. Configure the first plugin with the public HTTPS origin as `server` and `setupServer`, and the local forwarded origin as `setupUrl`. Open its settings, choose a username and a strong passphrase (at least 16 characters), and select **Create account**. On other devices install the plugin and sign in with the same server, username and passphrase. The QR code pre-fills the address and username but does not carry credentials. The random vault key is automatically wrapped and recovered on the client. After owner setup remove the temporary listener and SSH forward. Existing nonempty legacy stores are not migrated automatically.
+
+Account protocol: scrypt (N=131072, r=8, p=1) with a random 256-bit salt, HKDF-SHA-256 domain separation, AES-256-GCM-SIV key wrapping. The server receives a derived authentication value, not the passphrase, and stores its hash and the encrypted vault-key envelope. A weak passphrase is vulnerable to offline guessing if the database is stolen; use a password manager. There is no password reset or account recovery without the original passphrase and a usable backup. This protocol is experimental, not independently audited. The setup listener is disabled by default; initialization is atomic and is refused once a store is occupied. Only the public status and login routes should be exposed through HTTPS.
 
 ## Architecture
 

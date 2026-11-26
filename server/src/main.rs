@@ -20,6 +20,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+mod account;
 
 const CHUNK: usize = 1024 * 1024;
 const MAX_FILE: u64 = 512 * 1024 * 1024;
@@ -97,6 +98,7 @@ impl App {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             names.iter().any(|n| n == "deleted")
         };
+        db.execute_batch("CREATE TABLE IF NOT EXISTS owner_account (id INTEGER PRIMARY KEY CHECK(id=1), username TEXT NOT NULL, salt TEXT NOT NULL, auth_hash TEXT NOT NULL, envelope TEXT NOT NULL);")?;
         if !has_deleted {
             db.execute(
                 "ALTER TABLE files ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
@@ -608,8 +610,24 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let addr = std::env::var("SYNC_BIND").unwrap_or_else(|_| "127.0.0.1:8877".into());
+    if std::env::var("SYNC_ENABLE_OWNER_SETUP").as_deref() == Ok("1") {
+        let admin_addr =
+            std::env::var("SYNC_OWNER_SETUP_BIND").unwrap_or_else(|_| "127.0.0.1:8878".into());
+        let admin = Router::new()
+            .route("/v1/account/setup", post(account::setup))
+            .layer(DefaultBodyLimit::max(4096))
+            .with_state(app.clone());
+        let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, admin).await {
+                eprintln!("Owner setup listener: {e}");
+            }
+        });
+    }
     let router = Router::new()
         .route("/v1/health", get(|| async { "ok" }))
+        .route("/v1/account/status", get(account::status))
+        .route("/v1/account/login", post(account::login))
         .route("/v1/redeem", post(redeem))
         .route("/v1/pair", post(pair))
         .route("/v1/index", get(index))
@@ -647,7 +665,15 @@ async fn limit_requests(
     {
         return (StatusCode::UPGRADE_REQUIRED, "encrypted client required").into_response();
     }
-    if !matches!(req.uri().path(), "/v1/health" | "/v1/redeem" | "/v1/watch") {
+    if !matches!(
+        req.uri().path(),
+        "/v1/health"
+            | "/v1/redeem"
+            | "/v1/watch"
+            | "/v1/account/status"
+            | "/v1/account/setup"
+            | "/v1/account/login"
+    ) {
         if let Err(e) = s.auth(req.headers()) {
             return e.into_response();
         }

@@ -3,12 +3,13 @@ import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import * as QRCode from "qrcode";
 import { VaultCipher, newVaultKey, E2EE_PREFIX, KEY_CHECK } from "./crypto";
+import { accountStatus, createOwner, signIn, type AccountCredentials } from "./account-client";
 
 const CHUNK = 1024 * 1024;
 const MAX = 512 * CHUNK;
 const digest = (data: Uint8Array) => bytesToHex(sha256(data));
 type RemoteFile = { path: string; rev: number; hash: string; size: number; chunks: string[]; deleted?: boolean };
-type Config = { server: string; token: string; base: Record<string, string>; device: string; deleteEnabled: boolean; pendingDeletes: Record<string,string>; tombstones: Record<string,number>; encryptionKey?: string };
+type Config = { server: string; token: string; base: Record<string, string>; device: string; deleteEnabled: boolean; pendingDeletes: Record<string,string>; tombstones: Record<string,number>; encryptionKey?: string; username?: string; setupUrl?: string; setupServer?: string };
 const defaults: Config = {server:"",token:"",base:{},device:"Obsidian",deleteEnabled:false,pendingDeletes:{},tombstones:{}};
 const valid = (path: string) => path.length>0 && path.length<=4096 && path.split("/").every(x=>x && x!=="." && x!==".." && !x.endsWith(".") && !x.endsWith(" ") && !/[\\:*?"<>|\x00-\x1f]/.test(x) && ![".obsidian",".trash",".git"].includes(x.toLowerCase()));
 const delay = (ms:number)=>new Promise<void>(resolve=>window.setTimeout(resolve,ms));
@@ -113,7 +114,8 @@ export default class PrivateSync extends Plugin {
     this.registerEvent(this.app.vault.on("rename",(f,old)=>{this.localHashes.delete(old);this.localHashes.delete(f.path);changed();}));
     this.registerObsidianProtocolHandler("private-vault-sync",params=>{
       if(this.cfg.token){new Notice("Хранилище уже подключено");return;}
-      new PairConnectModal(this.app,this,params.server??"",params.code??"").open();
+      if(params.code)new PairConnectModal(this.app,this,params.server??"",params.code).open();
+      else new AccountConnectModal(this.app,this,params.server??"",params.username??"").open();
     });
     this.app.workspace.onLayoutReady(()=>{this.startWatch();void this.sync();});
   }
@@ -146,6 +148,7 @@ export default class PrivateSync extends Plugin {
   async connect(server:string,code:string,device:string,key:string){
     if(this.running||this.connecting)throw new Error("Синхронизация активна");
     if(this.cfg.token)throw Error("Already connected");
+    if(!/^[0-9a-f]{64}$/.test(code.trim()))throw Error("Введите действительный одноразовый код");
     new VaultCipher(key.trim());
     this.connecting=true;
     try{
@@ -153,6 +156,25 @@ export default class PrivateSync extends Plugin {
       const r=await this.req("POST","/redeem",{code:code.trim(),name:device},false,false);
       this.cfg.token=r.token;this.cfg.base=Object.create(null);this.cfg.pendingDeletes=Object.create(null);this.cfg.tombstones=Object.create(null);
       await this.remoteIndex();await this.save();
+    }catch(e){this.cfg.token="";delete this.cfg.encryptionKey;this.cipherCache=undefined;throw e;}
+    finally{this.connecting=false;}
+    this.startWatch();void this.sync();
+  }
+  async loginAccount(server:string,input:AccountCredentials,create=false){
+    if(this.running||this.connecting||this.cfg.token)throw Error("Устройство уже подключено или подключается");
+    this.connecting=true;
+    try{
+      this.cfg.server=server.trim();const origin=this.endpoint();
+      if(create){
+        if((await accountStatus(origin)).initialized)throw Error("Аккаунт уже существует. Используйте кнопку «Войти»");
+        if(!this.cfg.setupUrl||origin!==this.cfg.setupServer)throw Error("Первичная настройка доступна только на компьютере администратора для настроенного сервера");
+        await createOwner(this.cfg.setupUrl,input);
+      }
+      const session=await signIn(origin,input);
+      this.cfg.token=session.sessionId;this.cfg.encryptionKey=session.vaultKey;
+      this.cfg.username=input.username.trim();this.cfg.device=input.device.trim();
+      this.cfg.base=Object.create(null);this.cfg.pendingDeletes=Object.create(null);this.cfg.tombstones=Object.create(null);
+      await this.remoteIndex();delete this.cfg.setupUrl;delete this.cfg.setupServer;await this.save();
     }catch(e){this.cfg.token="";delete this.cfg.encryptionKey;this.cipherCache=undefined;throw e;}
     finally{this.connecting=false;}
     this.startWatch();void this.sync();
@@ -313,17 +335,13 @@ class SyncSettings extends PluginSettingTab {
   constructor(app:App,private p:PrivateSync){super(app,p);}
   display(){
     const el=this.containerEl;el.empty();el.createEl("h2",{text:"Private Vault Sync"});
-    let server=this.p.cfg.server,code="",device=this.p.cfg.device,key="";
-    new Setting(el).setName("Адрес сервера").addText(t=>t.setValue(server).onChange(v=>server=v));
-    new Setting(el).setName("Одноразовый код").addText(t=>{t.inputEl.type="password";t.onChange(v=>code=v);});
-    new Setting(el).setName("Имя устройства").addText(t=>t.setValue(device).onChange(v=>device=v));
     if(!this.p.cfg.token){
-      let setKey:(v:string)=>void=()=>{};
-      new Setting(el).setName("Ключ шифрования").setDesc("64 шестнадцатеричных символа. Сохрани ключ отдельно: без него восстановить данные невозможно.").addText(t=>{t.inputEl.type="password";t.onChange(v=>key=v);setKey=v=>{key=v;t.setValue(v);};});
-      new Setting(el).setName("Первое устройство").setDesc("Только для нового пустого сервера. На других устройствах используй тот же ключ.").addButton(b=>b.setButtonText("Создать ключ").onClick(()=>{if(!key)setKey(newVaultKey());new RecoveryKeyModal(this.app,key).open();}));
-    }else new Setting(el).setName("Шифрование").setDesc(this.p.cfg.encryptionKey?"AES-256-GCM-SIV":"Legacy test mode (not encrypted)").addButton(b=>b.setButtonText("Показать ключ восстановления").setDisabled(!this.p.cfg.encryptionKey).onClick(()=>new RecoveryKeyModal(this.app,this.p.cfg.encryptionKey!).open()));
-    new Setting(el).setName("Подключение").addButton(b=>b.setButtonText("Подключить").setCta().setDisabled(!!this.p.cfg.token).onClick(async()=>{b.setDisabled(true);try{await this.p.connect(server,code,device,key);code="";key="";new Notice("Подключено");this.display();}catch(e){new Notice(String(e));b.setDisabled(false);}}));
-    new Setting(el).setName("Новое устройство").addButton(b=>b.setButtonText("Получить код").setDisabled(!this.p.cfg.token).onClick(async()=>{try{const r=await this.p.pair();new PairCodeModal(this.app,this.p,r.code).open();}catch(e){new Notice(String(e));}}));
+      accountForm(el,this.p,this.p.cfg.server,this.p.cfg.username??"",()=>this.display());
+      return;
+    }
+    new Setting(el).setName("Аккаунт").setDesc((this.p.cfg.username??"Устройство")+" · "+this.p.cfg.server);
+    new Setting(el).setName("Шифрование").setDesc(this.p.cfg.encryptionKey?"AES-256-GCM-SIV":"Legacy test mode (not encrypted)");
+    new Setting(el).setName("Новое устройство").setDesc("Откройте ссылку или QR-код и войдите в свой аккаунт").addButton(b=>b.setButtonText("Подключить устройство").onClick(()=>new AccountLinkModal(this.app,this.p).open()));
     new Setting(el).setName("Состояние").setDesc(this.p.progress).addButton(b=>b.setButtonText("Синхронизировать").onClick(()=>void this.p.sync()));
     new Setting(el).setName("Синхронизация удалений").setDesc("По умолчанию выключена. Только подтверждённые локальные удаления; старые версии остаются на сервере.").addToggle(t=>t.setValue(this.p.cfg.deleteEnabled).onChange(async v=>{this.p.cfg.deleteEnabled=v;if(!v)this.p.cfg.pendingDeletes=Object.create(null);await this.p.save();}));
     if(Object.keys(this.p.cfg.pendingDeletes).length>10)new Setting(el).setName("Пакет удалений приостановлен").addButton(b=>b.setButtonText("Разрешить один пакет").onClick(()=>{this.p.allowBatchDelete=true;void this.p.sync();}));
@@ -331,6 +349,34 @@ class SyncSettings extends PluginSettingTab {
     new Setting(el).setName("История файла").addButton(b=>b.setButtonText("Открыть").setDisabled(!this.p.cfg.token).onClick(()=>new HistoryModal(this.app,this.p).open()));
     new Setting(el).setName("Ошибки и конфликты").addButton(b=>b.setButtonText("Подробнее").onClick(()=>new ErrorsModal(this.app,this.p).open()));
     el.createEl("p",{text:"Экспериментальная версия: конфликты не перезаписываются. Не используйте для единственной копии данных. Настройки .obsidian пока не передаются."});
+  }
+}
+function accountForm(el:HTMLElement,p:PrivateSync,initialServer:string,initialUsername:string,done:()=>void){
+  let server=initialServer,username=initialUsername,password="",device=p.cfg.device;
+  el.createEl("p",{text:"Войдите в аккаунт. Ключи шифрования создаются и восстанавливаются автоматически на устройстве."});
+  new Setting(el).setName("Адрес сервера").addText(t=>{t.setValue(server).onChange(v=>server=v);t.inputEl.placeholder="https://sync.example.com";});
+  new Setting(el).setName("Логин").addText(t=>{t.setValue(username).onChange(v=>username=v);t.inputEl.autocomplete="username";});
+  new Setting(el).setName("Пароль").addText(t=>{t.inputEl.type="password";t.inputEl.autocomplete="current-password";t.onChange(v=>password=v);});
+  new Setting(el).setName("Имя устройства").addText(t=>t.setValue(device).onChange(v=>device=v));
+  const feedback=el.createDiv();feedback.style.marginTop="12px";
+  const actions=new Setting(el).setName("Подключение");
+  let busy=false;
+  const submit=async(create:boolean)=>{if(busy)return;busy=true;feedback.setText(create?"Создание аккаунта…":"Вход…");try{await p.loginAccount(server,{username,password,device},create);password="";feedback.setText("Подключено");new Notice("Подключено");done();}catch(e){feedback.setText(e instanceof Error?e.message:String(e));}finally{busy=false;}};
+  actions.addButton(b=>b.setButtonText("Войти").setCta().onClick(()=>submit(false)));
+  if(p.cfg.setupUrl)actions.addButton(b=>b.setButtonText("Создать аккаунт").onClick(()=>submit(true)));
+  el.createEl("p",{text:"Используйте один и тот же логин и пароль на всех устройствах. Для нового аккаунта пароль должен быть не короче 16 символов. Сохраните его в менеджере паролей."});
+}
+class AccountConnectModal extends Modal{
+  constructor(app:App,private p:PrivateSync,private server:string,private username:string){super(app);}
+  onOpen(){this.contentEl.empty();this.contentEl.createEl("h2",{text:"Войти в Private Vault Sync"});accountForm(this.contentEl,this.p,this.server,this.username,()=>this.close());}
+}
+class AccountLinkModal extends Modal{
+  constructor(app:App,private p:PrivateSync){super(app);}
+  onOpen(){const el=this.contentEl;el.empty();el.createEl("h2",{text:"Подключить устройство"});
+    const link="obsidian://private-vault-sync?"+new URLSearchParams({server:this.p.endpoint(),username:this.p.cfg.username??""}).toString();
+    el.createEl("p",{text:"Установите плагин, откройте нужное хранилище, отсканируйте QR-код и введите пароль. Ссылка не содержит пароль или ключ."});
+    const canvas=el.createEl("canvas");canvas.style.display="block";canvas.style.margin="12px auto";void QRCode.toCanvas(canvas,link,{width:260,margin:2}).catch(()=>canvas.remove());
+    new Setting(el).addButton(b=>b.setButtonText("Скопировать ссылку").setCta().onClick(async()=>{await navigator.clipboard.writeText(link);new Notice("Ссылка скопирована");}));
   }
 }
 

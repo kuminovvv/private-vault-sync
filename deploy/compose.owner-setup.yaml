@@ -1,0 +1,8 @@
+# Temporary, loopback-only administrative listener. Remove after owner setup.
+services:
+  private-sync:
+    environment:
+      SYNC_ENABLE_OWNER_SETUP: "1"
+      SYNC_OWNER_SETUP_BIND: "0.0.0.0:8878"
+    ports:
+      - "127.0.0.1:8878:8878"
