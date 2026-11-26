@@ -78,6 +78,7 @@ struct App {
     quota: u64,
     requests: Arc<tokio::sync::Semaphore>,
     encrypted_only: bool,
+    enrollment_budget: Arc<Mutex<(std::time::Instant, u32)>>,
 }
 impl App {
     fn open(dir: PathBuf) -> std::result::Result<Self, Box<dyn std::error::Error>> {
@@ -141,6 +142,7 @@ impl App {
             quota,
             requests: Arc::new(tokio::sync::Semaphore::new(24)),
             encrypted_only,
+            enrollment_budget: Arc::new(Mutex::new((std::time::Instant::now(), 0))),
         })
     }
     fn pair(&self) -> Result<String> {
@@ -148,6 +150,15 @@ impl App {
         let db = self.db.lock().map_err(internal)?;
         db.execute("DELETE FROM pairs WHERE expires < ?", [now()])
             .map_err(internal)?;
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM pairs", [], |r| r.get(0))
+            .map_err(internal)?;
+        if count >= 8 {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many active pairing codes",
+            ));
+        }
         db.execute(
             "INSERT INTO pairs VALUES (?,?)",
             params![hash(code.as_bytes()), now() + 600],
@@ -199,11 +210,27 @@ struct Token {
     token: String,
 }
 async fn redeem(State(s): State<App>, Json(r): Json<Redeem>) -> Result<Json<Token>> {
+    {
+        let mut budget = s.enrollment_budget.lock().map_err(internal)?;
+        if budget.0.elapsed() >= std::time::Duration::from_secs(60) {
+            *budget = (std::time::Instant::now(), 0);
+        }
+        if budget.1 >= 60 {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "enrollment rate limit"));
+        }
+        budget.1 += 1;
+    }
     if !valid_hash(&r.code) || r.name.trim().is_empty() || r.name.len() > 100 {
         return Err(bad("invalid enrollment"));
     }
     let mut db = s.db.lock().map_err(internal)?;
     let tx = db.transaction().map_err(internal)?;
+    let count: i64 = tx
+        .query_row("SELECT count(*) FROM devices", [], |r| r.get(0))
+        .map_err(internal)?;
+    if count >= 32 {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "device limit reached"));
+    }
     let consumed = tx
         .execute(
             "DELETE FROM pairs WHERE code_hash=? AND expires>=?",
@@ -378,7 +405,10 @@ async fn commit(State(s): State<App>, h: HeaderMap, Json(c): Json<Commit>) -> Re
         let old=tx.query_row("SELECT path,rev,hash,size,chunks,deleted FROM files WHERE path=?",[&c.path],row_file).optional().map_err(internal)?;
         if let Some(ref f)=old {if !f.deleted && f.hash==c.hash{return Ok(Json(f.clone()));}}
         if old.as_ref().map(|v|v.rev).unwrap_or(0)!=c.base_rev{return Err((StatusCode::CONFLICT,"revision changed"));}
+        if old.is_none(){let count:i64=tx.query_row("SELECT count(*) FROM files",[],|r|r.get(0)).map_err(internal)?;if count>=20000{return Err((StatusCode::INSUFFICIENT_STORAGE,"file count limit reached"));}}
         if let Some(f)=old.filter(|f|!f.deleted) {
+            let count:i64=tx.query_row("SELECT count(*) FROM versions",[],|r|r.get(0)).map_err(internal)?;
+            if count>=50000{return Err((StatusCode::INSUFFICIENT_STORAGE,"history limit reached"));}
             tx.execute("INSERT INTO versions VALUES (?,?,?,?,?,?)",params![f.path,f.rev,f.hash,f.size,serde_json::to_string(&f.chunks).map_err(internal)?,now()]).map_err(internal)?;
         }
         let f=File{path:c.path,rev:c.base_rev+1,hash:c.hash,size:c.size,chunks:c.chunks,deleted:false};
@@ -616,6 +646,11 @@ async fn limit_requests(
             != Some("e2ee-v1")
     {
         return (StatusCode::UPGRADE_REQUIRED, "encrypted client required").into_response();
+    }
+    if !matches!(req.uri().path(), "/v1/health" | "/v1/redeem" | "/v1/watch") {
+        if let Err(e) = s.auth(req.headers()) {
+            return e.into_response();
+        }
     }
     let Ok(_permit) = s.requests.clone().try_acquire_owned() else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response();

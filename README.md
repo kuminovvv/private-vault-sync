@@ -5,7 +5,7 @@
 
 A self-hosted synchronization prototype for Obsidian, with a Rust server and a TypeScript plugin. The goal is simple device pairing and resilient transfers over unstable connections, without a separate desktop synchronization app.
 
-> **Experimental (0.3.0).** This is not a production-ready replacement for Obsidian Sync. Use a test vault and keep independent backups. Encrypted mode is implemented but has not been independently audited. Not affiliated with Obsidian.
+> **Experimental (0.3.1).** This is not a production-ready replacement for Obsidian Sync. Use a test vault and keep independent backups. Encrypted mode is implemented but has not been independently audited. Not affiliated with Obsidian.
 
 ## Features
 
@@ -17,6 +17,14 @@ A self-hosted synchronization prototype for Obsidian, with a Rust server and a T
 - Device listing and revocation; server stores token hashes.
 - Revision checks, retained history and restoration; conflicting versions are not silently overwritten.
 - Optional deletion propagation, disabled by default, with tombstones, history, local trash and explicit approval for batches of more than ten queued deletions.
+- Files are enumerated through the vault storage adapter, including extensions not indexed by Obsidian. Hidden folders and configuration are excluded.
+- Verified snapshots and offline recovery into a new directory; restored devices must enroll again.
+
+## Install the beta plugin
+
+Download the ZIP from the [Releases page](https://github.com/kuminovvv/private-vault-sync/releases), extract it into your vault's `.obsidian/plugins/private-vault-sync/`, then enable Private Vault Sync under Community plugins. On Android, use a file manager that can display hidden folders. There is no separate sync application. Keep the original vault and a separate backup until you have verified a complete round trip on two devices.
+
+For the first device enter the HTTPS address, a server-issued one-time code, and click **Create key**. Save the generated recovery key in your password manager. The plugin fills the key field automatically. On subsequent devices use the pairing link or QR code and the same recovery key. The code and the key are separate; do not share either publicly.
 
 ## Architecture
 
@@ -97,6 +105,10 @@ See [SECURITY.md](SECURITY.md). Licensed under [MIT](LICENSE).
 ## Isolated deployment pilot
 
 The Dockerfile and deploy/compose.test.yaml are intended for synthetic data only. The container has no published ports, runs without root, and uses a separate persistent data directory. The prototype enforces a block storage quota, a concurrent request limit, a body size limit and request timeout. These are not a substitute for a full security audit or a complete disk quota. Restrict pilot access at the reverse proxy, use HTTPS, and never connect the sole copy of a real vault. Set SYNC_PROXY_NETWORK to an existing dedicated proxy network; initialize deploy/data with owner UID/GID 10001. See the existing local tests for validation.
+
+## Backup and recovery
+
+Use Python 3.11+ on the server. A snapshot captures consistent SQLite metadata and copies all referenced immutable blocks, verifying SHA-256 checksums. Run `python3 deploy/backup.py snapshot --data deploy/data --backups backups --keep 7`. Verify a snapshot with `python3 deploy/backup.py verify --snapshot backups/<timestamp>`. Restore with `python3 deploy/backup.py restore --snapshot backups/<timestamp> --target restored-data`. The target must not exist. Never overwrite an active store; stop the server and follow an offline migration procedure. Restored stores require re-enrollment, and the recovery key remains necessary. Keep additional off-host backups.
 
 ## Experimental encrypted protocol (v1)
 

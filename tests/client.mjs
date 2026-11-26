@@ -42,13 +42,16 @@ async function vault(name){
  const p=x=>join(dir,...x.split('/'));
  const adapter={
   async exists(x){try{await fs.stat(p(x));return true;}catch{return false;}},
+  async stat(x){try{const s=await fs.stat(p(x));return {type:s.isDirectory()?'folder':'file',size:s.size,mtime:s.mtimeMs,ctime:s.ctimeMs};}catch(e){if(e.code==='ENOENT')return null;throw e;}},
+  async list(x){const entries=await fs.readdir(p(x),{withFileTypes:true});const files=[],folders=[];for(const e of entries){const name=x?x+'/'+e.name:e.name;if(e.isFile())files.push(name);else if(e.isDirectory())folders.push(name);}return {files,folders};},
   mkdir:x=>fs.mkdir(p(x),{recursive:true}),
   readBinary:async x=>arr(await fs.readFile(p(x))),
-  writeBinary:async(x,b)=>fs.writeFile(p(x),Buffer.from(b)),
+  writeBinary:async(x,b)=>{if(x.startsWith('.obsidian/'))await fs.writeFile(p(x),Buffer.from(b));else await write(x,Buffer.from(b));},
+  async trashLocal(x){await fs.mkdir(join(dir,'.trash'),{recursive:true});await fs.rename(p(x),join(dir,'.trash',x.replaceAll('/','_')));files.delete(x);},
   rmdir:(x,recursive)=>fs.rm(p(x),{recursive,force:true})
  };
  const v={adapter,configDir:'.obsidian',getFiles:()=>[...files.values()],
-  getAbstractFileByPath:x=>files.get(x)??null,
+  getAbstractFileByPath:x=>x.endsWith('.zst')?null:files.get(x)??null,
   async readBinary(f){return arr(await fs.readFile(p(f.path)));},
   async createFolder(x){await fs.mkdir(p(x),{recursive:true});},
   async createBinary(x,b){if(files.has(x))throw Error('already exists');await write(x,Buffer.from(b));},
@@ -87,6 +90,8 @@ try{
  }
  const payload=randomBytes(3*1024*1024+137);
  await a.write('notes/big.bin',payload);await a.write('notes/тест.md',Buffer.from('Привет'));
+ await a.write('notes/session.jsonl.zst',Buffer.from('synthetic unindexed file'));
+ await fs.writeFile(join(a.dir,'.obsidian','private-test.txt'),'must not sync');
  await sync(a.client);
  const remote=(await a.client.remoteIndex()).find(x=>x.path==='notes/big.bin');
  if(encrypted){
@@ -106,6 +111,8 @@ try{
  assert.ok(!networkChunks.includes(remote.chunks[0]),'downloaded block must be reused');
  assert.deepEqual(await b.read('notes/big.bin'),payload);
  assert.equal((await b.read('notes/тест.md')).toString(),'Привет');
+ assert.equal((await b.read('notes/session.jsonl.zst')).toString(),'synthetic unindexed file');
+ assert.equal(await b.client.app.vault.adapter.exists('.obsidian/private-test.txt'),false);
  console.log('PASS: bundled plugin, interrupted download, cached chunk reuse, UTF-8 paths');
  await b.write('notes/тест.md',Buffer.from('изменено'));await sync(b.client);await sync(a.client);
  assert.equal((await a.read('notes/тест.md')).toString(),'изменено');

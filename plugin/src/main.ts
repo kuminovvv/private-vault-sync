@@ -165,6 +165,19 @@ export default class PrivateSync extends Plugin {
     if(await a.exists(path))return;
     try{await a.mkdir(path);}catch(e){if(!await a.exists(path))throw e;}
   }
+  allowedPath(path:string){const config=this.app.vault.configDir.toLowerCase();return valid(path)&&path.split('/').every(p=>!p.startsWith('.'))&&path.toLowerCase()!==config&&!path.toLowerCase().startsWith(config+'/');}
+  async localPaths():Promise<string[]>{
+    const a=this.app.vault.adapter,paths=new Set<string>();
+    const folders=[''],seen=new Set<string>();
+    while(folders.length){
+      const folder=folders.pop()!;if(seen.has(folder))continue;seen.add(folder);
+      if(seen.size>20000||folder.split('/').length>80)throw Error("Vault folder limit reached");
+      const entries=await a.list(folder);
+      for(const f of entries.files)if(this.allowedPath(f))paths.add(f);
+      for(const d of entries.folders)if(this.allowedPath(d))folders.push(d);
+    }
+    return [...paths];
+  }
   cachePath(r:RemoteFile){return this.app.vault.configDir+"/plugins/"+this.manifest.id+"/chunks/"+digest(new TextEncoder().encode(r.path))+"-"+r.hash;}
   async fetchFile(r:RemoteFile):Promise<Uint8Array>{
     if(!valid(r.path)||!/^[0-9a-f]{64}$/.test(r.hash)||r.size>MAX||r.size<0||!Number.isSafeInteger(r.size)||r.chunks.length!==Math.ceil(r.size/CHUNK))throw new Error("Некорректный файл сервера");
@@ -201,9 +214,8 @@ export default class PrivateSync extends Plugin {
     const current=await this.local(r.path,true);
     if(current?.hash!==expected)throw new Error("Файл изменён перед удалением");
     const file=this.app.vault.getAbstractFileByPath(r.path);
-    if(!(file instanceof TFile))throw new Error("Файл не найден");
     this.remoteTrash.add(r.path);
-    try{await this.app.fileManager.trashFile(file);await this.markDeleted(r.path,r.rev);}
+    try{if(file instanceof TFile)await this.app.fileManager.trashFile(file);else await this.app.vault.adapter.trashLocal(r.path);await this.markDeleted(r.path,r.rev);}
     finally{this.remoteTrash.delete(r.path);}
   }
   async restoreVersion(r:RemoteFile){
@@ -222,16 +234,18 @@ export default class PrivateSync extends Plugin {
     }finally{this.running=false;}
   }
   async local(path:string,force=false):Promise<{data?:Uint8Array;hash:string}|null>{
-    const f=this.app.vault.getAbstractFileByPath(path);
-    if(!(f instanceof TFile)){this.localHashes.delete(path);return null;}
-    if(f.stat.size>MAX)throw new Error("Файл больше 512 МиБ");
-    const mtime=f.stat.mtime,size=f.stat.size,c=this.localHashes.get(path);
+    if(!this.allowedPath(path))throw Error("Excluded path");
+    const a=this.app.vault.adapter,stat=await a.stat(path);
+    if(!stat||stat.type!=="file"){this.localHashes.delete(path);return null;}
+    if(stat.size>MAX)throw new Error("Файл больше 512 МиБ");
+    const mtime=stat.mtime,size=stat.size,c=this.localHashes.get(path);
     if(!force&&c&&c.mtime===mtime&&c.size===size)return {hash:c.hash};
-    const plain=new Uint8Array(await this.app.vault.readBinary(f));
+    const plain=new Uint8Array(await a.readBinary(path));
     const data=this.cipher()?.encode(path,plain)??plain;
     if(data.length>MAX)throw Error("Encrypted file exceeds server size limit");
     const hash=digest(data);
-    if(f.stat.mtime!==mtime||f.stat.size!==size)throw new Error("Файл изменён при чтении");
+    const after=await a.stat(path);
+    if(!after||after.type!=="file"||after.mtime!==mtime||after.size!==size)throw new Error("Файл изменён при чтении");
     this.localHashes.set(path,{mtime,size,hash});
     return {data,hash};
   }
@@ -249,9 +263,9 @@ export default class PrivateSync extends Plugin {
     const data=await this.fetchFile(r);
     const current=await this.local(r.path,true);if((current?.hash??null)!==expected)throw new Error("Файл изменён во время загрузки");
     const parts=r.path.split("/");parts.pop();let parent="";
-    for(const p of parts){parent=parent?parent+"/"+p:p;if(!this.app.vault.getAbstractFileByPath(parent)){try{await this.app.vault.createFolder(parent);}catch(e){if(!this.app.vault.getAbstractFileByPath(parent))throw e;}}}
+    for(const p of parts){parent=parent?parent+"/"+p:p;await this.ensureFolder(parent);}
     const existing=this.app.vault.getAbstractFileByPath(r.path);
-    if(existing instanceof TFile)await this.app.vault.modifyBinary(existing,data.buffer as ArrayBuffer);else if(!existing)await this.app.vault.createBinary(normalizePath(r.path),data.buffer as ArrayBuffer);else throw new Error("Конфликт файла и папки");
+    if(existing instanceof TFile)await this.app.vault.modifyBinary(existing,data.buffer as ArrayBuffer);else if(!existing){const stat=await this.app.vault.adapter.stat(r.path);if(stat?.type==="folder")throw Error("Конфликт файла и папки");await this.app.vault.adapter.writeBinary(normalizePath(r.path),data.buffer as ArrayBuffer);}else throw new Error("Конфликт файла и папки");
     this.cfg.base[r.path]=r.hash;delete this.cfg.tombstones[r.path];delete this.cfg.pendingDeletes[r.path];await this.clearCache(r);
   }
   async sync(){
@@ -266,7 +280,7 @@ export default class PrivateSync extends Plugin {
       if(Date.now()-this.fullCheckAt>30*60*1000){this.localHashes.clear();this.fullCheckAt=Date.now();}
       const remote=await this.remoteIndex();
       const map=new Map(remote.map(r=>[r.path,r]));
-      const paths=[...new Set([...this.app.vault.getFiles().map(f=>f.path),...map.keys()])].filter(valid);
+      const paths=[...new Set([...await this.localPaths(),...map.keys()])].filter(p=>this.allowedPath(p));
       this.syncStarted=Date.now();this.total=paths.length;this.completed=0;this.transferred=0;let i=0;
       const worker=async()=>{while(i<paths.length&&!this.stopped){const path=paths[i++];try{
         const l=await this.local(path),r=map.get(path),base=this.cfg.base[path];
@@ -304,10 +318,11 @@ class SyncSettings extends PluginSettingTab {
     new Setting(el).setName("Одноразовый код").addText(t=>{t.inputEl.type="password";t.onChange(v=>code=v);});
     new Setting(el).setName("Имя устройства").addText(t=>t.setValue(device).onChange(v=>device=v));
     if(!this.p.cfg.token){
-      new Setting(el).setName("Ключ шифрования").setDesc("64 hex characters. Сохрани ключ отдельно: без него восстановить данные невозможно.").addText(t=>{t.inputEl.type="password";t.onChange(v=>key=v);});
-      new Setting(el).setName("Первое устройство").setDesc("Только для нового пустого сервера. На других устройствах используй тот же ключ.").addButton(b=>b.setButtonText("Создать ключ").onClick(()=>new RecoveryKeyModal(this.app,newVaultKey()).open()));
-    }else new Setting(el).setName("Шифрование").setDesc(this.p.cfg.encryptionKey?"AES-256-GCM-SIV":"Legacy test mode (not encrypted)");
-    new Setting(el).setName("Подключение").addButton(b=>b.setButtonText("Подключить").setCta().setDisabled(!!this.p.cfg.token).onClick(async()=>{try{await this.p.connect(server,code,device,key);code="";key="";new Notice("Подключено");this.display();}catch(e){new Notice(String(e));}}));
+      let setKey:(v:string)=>void=()=>{};
+      new Setting(el).setName("Ключ шифрования").setDesc("64 шестнадцатеричных символа. Сохрани ключ отдельно: без него восстановить данные невозможно.").addText(t=>{t.inputEl.type="password";t.onChange(v=>key=v);setKey=v=>{key=v;t.setValue(v);};});
+      new Setting(el).setName("Первое устройство").setDesc("Только для нового пустого сервера. На других устройствах используй тот же ключ.").addButton(b=>b.setButtonText("Создать ключ").onClick(()=>{if(!key)setKey(newVaultKey());new RecoveryKeyModal(this.app,key).open();}));
+    }else new Setting(el).setName("Шифрование").setDesc(this.p.cfg.encryptionKey?"AES-256-GCM-SIV":"Legacy test mode (not encrypted)").addButton(b=>b.setButtonText("Показать ключ восстановления").setDisabled(!this.p.cfg.encryptionKey).onClick(()=>new RecoveryKeyModal(this.app,this.p.cfg.encryptionKey!).open()));
+    new Setting(el).setName("Подключение").addButton(b=>b.setButtonText("Подключить").setCta().setDisabled(!!this.p.cfg.token).onClick(async()=>{b.setDisabled(true);try{await this.p.connect(server,code,device,key);code="";key="";new Notice("Подключено");this.display();}catch(e){new Notice(String(e));b.setDisabled(false);}}));
     new Setting(el).setName("Новое устройство").addButton(b=>b.setButtonText("Получить код").setDisabled(!this.p.cfg.token).onClick(async()=>{try{const r=await this.p.pair();new PairCodeModal(this.app,this.p,r.code).open();}catch(e){new Notice(String(e));}}));
     new Setting(el).setName("Состояние").setDesc(this.p.progress).addButton(b=>b.setButtonText("Синхронизировать").onClick(()=>void this.p.sync()));
     new Setting(el).setName("Синхронизация удалений").setDesc("По умолчанию выключена. Только подтверждённые локальные удаления; старые версии остаются на сервере.").addToggle(t=>t.setValue(this.p.cfg.deleteEnabled).onChange(async v=>{this.p.cfg.deleteEnabled=v;if(!v)this.p.cfg.pendingDeletes=Object.create(null);await this.p.save();}));

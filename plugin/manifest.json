@@ -1,1 +1,1 @@
-{"id":"private-vault-sync","name":"Private Vault Sync","version":"0.3.0","minAppVersion":"1.6.0","description":"Experimental encrypted self-hosted synchronization with resumable chunks.","author":"Private Vault Sync","isDesktopOnly":false}
+{"id":"private-vault-sync","name":"Private Vault Sync","version":"0.3.1","minAppVersion":"1.6.0","description":"Experimental encrypted self-hosted synchronization with resumable chunks.","author":"Private Vault Sync","isDesktopOnly":false}
