@@ -83,7 +83,7 @@ A local stress test transferred 800 MiB of synthetic attachments in both directi
 
 - End-to-end encryption, with secure key management and recovery.
 - Full settings sync, directory renames and text conflict merging.
-- Storage quotas, garbage collection, tested backup/restore and security review.
+- Storage quota validation, garbage collection, tested backup/restore and security review.
 - Memory-efficient streaming of large files, especially on mobile.
 - Real Obsidian desktop and Android/iOS testing, then hardened self-hosted deployment.
 
@@ -92,3 +92,8 @@ A local stress test transferred 800 MiB of synthetic attachments in both directi
 Single-vault prototype. Files up to 512 MiB; the plugin can allocate whole files in memory. No end-to-end encryption: the server can read contents, filenames and metadata. The GUI smoke test fixture exists but real GUI integration and mobile testing have not been completed. Do not make the server publicly accessible or use it as the sole copy of important data.
 
 See [SECURITY.md](SECURITY.md). Licensed under [MIT](LICENSE).
+
+
+## Isolated deployment pilot
+
+The Dockerfile and deploy/compose.test.yaml are intended for synthetic data only. The container has no published ports, runs without root, and uses a separate persistent data directory. The prototype enforces a block storage quota, a concurrent request limit, a body size limit and request timeout. These are not a substitute for a full security audit or a complete disk quota. Restrict pilot access at the reverse proxy, use HTTPS, and never connect the sole copy of a real vault. Set SYNC_PROXY_NETWORK to an existing dedicated proxy network; initialize deploy/data with owner UID/GID 10001. See the existing local tests for validation.

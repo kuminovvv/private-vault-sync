@@ -74,6 +74,9 @@ struct App {
     blobs: PathBuf,
     changes: tokio::sync::broadcast::Sender<()>,
     sockets: Arc<tokio::sync::Semaphore>,
+    storage: Arc<Mutex<u64>>,
+    quota: u64,
+    requests: Arc<tokio::sync::Semaphore>,
 }
 impl App {
     fn open(dir: PathBuf) -> std::result::Result<Self, Box<dyn std::error::Error>> {
@@ -98,11 +101,26 @@ impl App {
                 [],
             )?;
         }
+        let used = fs::read_dir(dir.join("blobs"))?.try_fold(
+            0u64,
+            |total, entry| -> std::io::Result<u64> {
+                let m = entry?.metadata()?;
+                Ok(total.saturating_add(if m.is_file() { m.len() } else { 0 }))
+            },
+        )?;
+        let quota = std::env::var("SYNC_QUOTA_BYTES")
+            .ok()
+            .map(|v| v.parse::<u64>())
+            .transpose()?
+            .unwrap_or(8 * 1024 * 1024 * 1024);
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             blobs: dir.join("blobs"),
             changes: tokio::sync::broadcast::channel(128).0,
             sockets: Arc::new(tokio::sync::Semaphore::new(32)),
+            storage: Arc::new(Mutex::new(used)),
+            quota,
+            requests: Arc::new(tokio::sync::Semaphore::new(24)),
         })
     }
     fn pair(&self) -> Result<String> {
@@ -248,16 +266,25 @@ async fn upload(
         return Err(bad("invalid chunk or checksum"));
     }
     let blobs = s.blobs.clone();
+    let storage = s.storage.clone();
+    let quota = s.quota;
     tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut used = storage.lock().map_err(internal)?;
         let target = blobs.join(id);
         if target.is_file() {
             return Ok(());
+        }
+        if used.saturating_add(b.len() as u64) > quota {
+            return Err((StatusCode::INSUFFICIENT_STORAGE, "storage quota reached"));
         }
         let mut tmp = tempfile::NamedTempFile::new_in(&blobs).map_err(internal)?;
         tmp.write_all(&b).map_err(internal)?;
         tmp.as_file().sync_all().map_err(internal)?;
         match tmp.persist_noclobber(&target) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                *used += b.len() as u64;
+                Ok(())
+            }
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(internal(e)),
         }
@@ -527,9 +554,26 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/v1/devices/{id}", axum::routing::delete(revoke))
         .route("/v1/watch", get(watch))
         .layer(DefaultBodyLimit::max(2 * CHUNK))
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            limit_requests,
+        ))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Listening on {}", addr);
     axum::serve(listener, router).await?;
     Ok(())
+}
+async fn limit_requests(
+    State(s): State<App>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Ok(_permit) = s.requests.clone().try_acquire_owned() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response();
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(90), next.run(req)).await {
+        Ok(r) => r,
+        Err(_) => (StatusCode::REQUEST_TIMEOUT, "request timed out").into_response(),
+    }
 }
