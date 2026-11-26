@@ -5,7 +5,7 @@ COPY server/src ./src
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
-RUN groupadd -g 10001 sync && useradd -u 10001 -g 10001 -M -s /usr/sbin/nologin sync
+RUN groupadd -g 10001 vaultsync && useradd -u 10001 -g 10001 -M -s /usr/sbin/nologin vaultsync
 COPY --from=build /app/target/release/private-sync /usr/local/bin/private-sync
 USER 10001:10001
 ENV SYNC_BIND=0.0.0.0:8877 SYNC_DATA=/data
