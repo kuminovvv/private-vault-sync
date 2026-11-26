@@ -1,0 +1,21 @@
+# Rust and Node build output
+/target/
+/server/target/
+/plugin/node_modules/
+/plugin/main.js
+/dist/
+
+# Runtime data and local credentials
+data/
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+.obsidian/
+.trash/
+*.pem
+*.key

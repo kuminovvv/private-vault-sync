@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+      - name: Prepare Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt && rustup default stable
+      - name: Check Rust formatting
+        working-directory: server
+        run: cargo fmt --check
+      - name: Build server
+        working-directory: server
+        run: cargo build --locked
+      - name: Build plugin
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+      - name: Integration tests
+        run: |
+          exe=./server/target/debug/private-sync
+          if [[ "$RUNNER_OS" == Windows ]]; then exe="$exe.exe"; fi
+          node tests/integration.mjs "$exe"
+          node tests/client.mjs "$exe"
+      - name: Upload test plugin
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-vault-sync-plugin
+          path: |
+            plugin/main.js
+            plugin/manifest.json
+          if-no-files-found: error
