@@ -21,6 +21,9 @@ export default class PrivateSync extends Plugin {
   pending=false;
   stopped=false;
   status!:HTMLElement;
+  settingsStatus?:HTMLElement;
+  settingsLastSuccess?:HTMLElement;
+  lastSuccessAt=0;
   progress="";
   saving:Promise<void>=Promise.resolve();
   remoteTrash=new Set<string>();
@@ -120,7 +123,12 @@ export default class PrivateSync extends Plugin {
     this.app.workspace.onLayoutReady(()=>{this.startWatch();void this.sync();});
   }
   onunload(){this.stopped=true;this.stopWatch();}
-  render(s:string){this.progress=s; this.status?.setText("Private Sync: "+s);}
+  render(s:string){
+    this.progress=s;
+    this.status?.setText("Private Sync: "+s);
+    this.settingsStatus?.setText(s);
+    this.settingsLastSuccess?.setText(this.lastSuccessAt?"Последняя успешная синхронизация: "+new Date(this.lastSuccessAt).toLocaleTimeString():"Успешная синхронизация ещё не завершена");
+  }
   async save(){
     const snapshot=JSON.parse(JSON.stringify(this.cfg));
     const next=this.saving.catch(()=>{}).then(()=>this.saveData(snapshot));
@@ -298,12 +306,14 @@ export default class PrivateSync extends Plugin {
     const batchAllowed=deleteCount<=10||this.allowBatchDelete;
     this.allowBatchDelete=false;
     try{
-      this.render("Проверка…");
+      this.render("Проверка сервера…");
       if(Date.now()-this.fullCheckAt>30*60*1000){this.localHashes.clear();this.fullCheckAt=Date.now();}
       const remote=await this.remoteIndex();
+      this.render("Проверка локальных файлов…");
       const map=new Map(remote.map(r=>[r.path,r]));
       const paths=[...new Set([...await this.localPaths(),...map.keys()])].filter(p=>this.allowedPath(p));
       this.syncStarted=Date.now();this.total=paths.length;this.completed=0;this.transferred=0;let i=0;
+      this.renderProgress();
       const worker=async()=>{while(i<paths.length&&!this.stopped){const path=paths[i++];try{
         const l=await this.local(path),r=map.get(path),base=this.cfg.base[path];
         if(l)delete this.cfg.pendingDeletes[path];
@@ -325,7 +335,7 @@ export default class PrivateSync extends Plugin {
         else if(l&&r){if(base===r.hash){await this.push(path,l,r);}else if(base===l.hash){await this.pull(r,l.hash);}else{conflicts++;this.conflictsByPath.push(path);}}
       }catch(e){errors++;this.errorsByPath[path]=e instanceof Error?e.message:"unknown";console.warn("Private Sync file error",this.errorsByPath[path]);}finally{done++;this.completed=done;this.renderProgress();}}};
       await Promise.all(Array.from({length:Platform.isMobile?2:3},()=>worker()));
-      await this.save();this.render(errors||conflicts?"Ошибки: "+errors+" · Конфликты: "+conflicts:"Синхронизировано");
+      await this.save();if(!errors&&!conflicts)this.lastSuccessAt=Date.now();this.render(errors||conflicts?"Ошибки: "+errors+" · Конфликты: "+conflicts:"Синхронизировано");
       if(conflicts)new Notice("Private Sync: конфликтующие файлы оставлены без изменений ("+conflicts+")");
     }catch(e){this.render("Ошибка: "+(e instanceof Error?e.message:"unknown"));}
     finally{this.running=false;if(this.pending&&!this.stopped){this.pending=false;window.setTimeout(()=>void this.sync(),500);}}
@@ -335,6 +345,7 @@ class SyncSettings extends PluginSettingTab {
   constructor(app:App,private p:PrivateSync){super(app,p);}
   display(){
     const el=this.containerEl;el.empty();el.createEl("h2",{text:"Private Vault Sync"});
+    this.p.settingsStatus=undefined;this.p.settingsLastSuccess=undefined;
     if(!this.p.cfg.token){
       accountForm(el,this.p,this.p.cfg.server,this.p.cfg.username??"",()=>this.display());
       return;
@@ -342,7 +353,9 @@ class SyncSettings extends PluginSettingTab {
     new Setting(el).setName("Аккаунт").setDesc((this.p.cfg.username??"Устройство")+" · "+this.p.cfg.server);
     new Setting(el).setName("Шифрование").setDesc(this.p.cfg.encryptionKey?"AES-256-GCM-SIV":"Legacy test mode (not encrypted)");
     new Setting(el).setName("Новое устройство").setDesc("Откройте ссылку или QR-код и войдите в свой аккаунт").addButton(b=>b.setButtonText("Подключить устройство").onClick(()=>new AccountLinkModal(this.app,this.p).open()));
-    new Setting(el).setName("Состояние").setDesc(this.p.progress).addButton(b=>b.setButtonText("Синхронизировать").onClick(()=>void this.p.sync()));
+    const state=new Setting(el).setName("Состояние").setDesc(this.p.progress).addButton(b=>b.setButtonText("Синхронизировать").onClick(()=>void this.p.sync()));
+    state.descEl.empty();
+    this.p.settingsStatus=state.descEl.createDiv();this.p.settingsLastSuccess=state.descEl.createDiv();this.p.render(this.p.progress);
     new Setting(el).setName("Синхронизация удалений").setDesc("По умолчанию выключена. Только подтверждённые локальные удаления; старые версии остаются на сервере.").addToggle(t=>t.setValue(this.p.cfg.deleteEnabled).onChange(async v=>{this.p.cfg.deleteEnabled=v;if(!v)this.p.cfg.pendingDeletes=Object.create(null);await this.p.save();}));
     if(Object.keys(this.p.cfg.pendingDeletes).length>10)new Setting(el).setName("Пакет удалений приостановлен").addButton(b=>b.setButtonText("Разрешить один пакет").onClick(()=>{this.p.allowBatchDelete=true;void this.p.sync();}));
     new Setting(el).setName("Устройства").addButton(b=>b.setButtonText("Показать").setDisabled(!this.p.cfg.token).onClick(()=>new DevicesModal(this.app,this.p).open()));
@@ -350,6 +363,7 @@ class SyncSettings extends PluginSettingTab {
     new Setting(el).setName("Ошибки и конфликты").addButton(b=>b.setButtonText("Подробнее").onClick(()=>new ErrorsModal(this.app,this.p).open()));
     el.createEl("p",{text:"Экспериментальная версия: конфликты не перезаписываются. Не используйте для единственной копии данных. Настройки .obsidian пока не передаются."});
   }
+  hide(){this.p.settingsStatus=undefined;this.p.settingsLastSuccess=undefined;}
 }
 function accountForm(el:HTMLElement,p:PrivateSync,initialServer:string,initialUsername:string,done:()=>void){
   let server=initialServer,username=initialUsername,password="",device=p.cfg.device;
